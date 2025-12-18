@@ -312,14 +312,22 @@ class ComprehensiveServerDetector:
     2. Properly tracks undetectable servers
     3. Retry logic for transient failures
     4. Tracks detection confidence
+    5. Optional proxy support for detection
     """
     
-    def __init__(self, cookie: str, edge_detector: EdgeCenterDetector, rate_limiter: ImprovedRateLimiter):
+    def __init__(self, cookie: str, edge_detector: EdgeCenterDetector, rate_limiter: ImprovedRateLimiter, use_proxy: dict = None):
         self.cookie = cookie
         self.edge_detector = edge_detector
         self.rate_limiter = rate_limiter
+        self.proxy_id = use_proxy.get('id', 'direct') if use_proxy else 'direct'
         
         self.session = requests.Session()
+        
+        # Configure proxy if provided
+        if use_proxy:
+            proxy_url = f"http://{use_proxy['user']}:{use_proxy['pass']}@{use_proxy['host']}:{use_proxy['port']}"
+            self.session.proxies = {'http': proxy_url, 'https': proxy_url}
+        
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=20,
             pool_maxsize=40,
@@ -345,7 +353,7 @@ class ComprehensiveServerDetector:
         server_info.detection_attempts += 1
         server_info.detection_time = datetime.now().isoformat()
         
-        self.rate_limiter.wait_if_needed('join', 'detection')
+        self.rate_limiter.wait_if_needed('join', self.proxy_id)
         
         start_time = time.time()
         
@@ -367,7 +375,7 @@ class ComprehensiveServerDetector:
             # Handle rate limiting
             if response.status_code == 429:
                 retry_after = float(response.headers.get('Retry-After', 5))
-                self.rate_limiter.record_rate_limit('join', 'detection', retry_after)
+                self.rate_limiter.record_rate_limit('join', self.proxy_id, retry_after)
                 server_info.server_type = ServerType.ERROR
                 server_info.last_error = f"Rate limited (retry after {retry_after}s)"
                 
@@ -387,7 +395,7 @@ class ComprehensiveServerDetector:
                     return self.detect_server(server_info, max_retries)
                 return server_info
             
-            self.rate_limiter.record_success('join', 'detection')
+            self.rate_limiter.record_success('join', self.proxy_id)
             
             # Parse response
             data = response.json()
@@ -682,6 +690,7 @@ class ImprovedNonUDMUXScanner:
         
         # State
         self.cookies = []
+        self.proxy_cookie_pairs = []  # List of (proxy, cookie, pair_id) tuples
         self.rate_limiter = ImprovedRateLimiter()
         self.edge_detector = EdgeCenterDetector()
         
@@ -699,6 +708,14 @@ class ImprovedNonUDMUXScanner:
             'errors': 0,
             'start_time': 0
         }
+        
+        # Proxy performance tracking
+        self.proxy_stats = defaultdict(lambda: {
+            'requests': 0,
+            'successes': 0,
+            'errors': 0,
+            'servers_found': 0
+        })
         
         # Database
         self.init_database()
@@ -823,6 +840,27 @@ class ImprovedNonUDMUXScanner:
         print(f"\n✅ {len(valid)}/{len(cookies)} cookies valid")
         return valid
     
+    def create_proxy_cookie_pairs(self):
+        """Create optimized proxy-cookie pairs for parallel requests"""
+        self.proxy_cookie_pairs = []
+        
+        for i, cookie in enumerate(self.cookies):
+            proxy = self.proxy_pool[i % len(self.proxy_pool)]
+            pair_id = f"{proxy['id']}-C{i+1}"
+            
+            self.proxy_cookie_pairs.append({
+                'proxy': proxy,
+                'cookie': cookie,
+                'pair_id': pair_id,
+                'cookie_idx': i
+            })
+        
+        print(f"\n🔗 Created {len(self.proxy_cookie_pairs)} proxy-cookie pairs:")
+        for pair in self.proxy_cookie_pairs:
+            print(f"   {pair['pair_id']}: {pair['proxy']['id']} + Cookie {pair['cookie_idx']+1}")
+        
+        return self.proxy_cookie_pairs
+    
     def discovery_callback(self, new_count: int, total: int):
         """Callback for discovery progress"""
         with self.lock:
@@ -830,9 +868,19 @@ class ImprovedNonUDMUXScanner:
         print(f"📡 Discovered: +{new_count} (Total: {total})")
     
     def detection_worker(self, game_id: str, job_queue: queue.Queue, worker_id: int):
-        """Worker thread for detecting server types"""
-        cookie = self.cookies[worker_id % len(self.cookies)]
-        detector = ComprehensiveServerDetector(cookie, self.edge_detector, self.rate_limiter)
+        """Worker thread for detecting server types using proxy-cookie pairs"""
+        # Use proxy-cookie pairs for better distribution
+        pair = self.proxy_cookie_pairs[worker_id % len(self.proxy_cookie_pairs)]
+        cookie = pair['cookie']
+        proxy = pair['proxy']
+        pair_id = pair['pair_id']
+        
+        detector = ComprehensiveServerDetector(
+            cookie, 
+            self.edge_detector, 
+            self.rate_limiter,
+            use_proxy=proxy  # Use proxy for detection
+        )
         
         while True:
             try:
@@ -981,17 +1029,128 @@ class ImprovedNonUDMUXScanner:
             'start_time': time.time()
         }
         
-        # Phase 1: Discovery
+        # Phase 1: Discovery using multiple proxy-cookie pairs in parallel
         print("\n📡 PHASE 1: Server Discovery")
+        print(f"   Using {len(self.proxy_cookie_pairs)} proxy-cookie pairs in parallel")
         print("-" * 40)
         
-        discoverer = ComprehensiveServerDiscovery(
-            self.cookies[0],
-            self.rate_limiter,
-            self.proxy_pool[0] if self.proxy_pool else None
-        )
+        all_discovered_servers = {}
+        discovery_lock = threading.Lock()
         
-        servers = discoverer.discover_all_servers(game_id, callback=self.discovery_callback)
+        def parallel_discovery(pair, sort_config_idx):
+            """Discovery worker for a single proxy-cookie pair"""
+            discoverer = ComprehensiveServerDiscovery(
+                pair['cookie'],
+                self.rate_limiter,
+                pair['proxy']
+            )
+            
+            # Each worker uses a different sort configuration
+            sort_orders = [
+                {'sortOrder': 1, 'excludeFullGames': False},
+                {'sortOrder': 2, 'excludeFullGames': False},
+                {'sortOrder': 1, 'excludeFullGames': True},
+            ]
+            sort_config = sort_orders[sort_config_idx % len(sort_orders)]
+            
+            cursor = ""
+            consecutive_empty = 0
+            max_empty = 5
+            found_count = 0
+            
+            while consecutive_empty < max_empty:
+                self.rate_limiter.wait_if_needed('servers', pair['pair_id'])
+                
+                try:
+                    params = {
+                        'sortOrder': sort_config['sortOrder'],
+                        'excludeFullGames': str(sort_config['excludeFullGames']).lower(),
+                        'limit': 100
+                    }
+                    if cursor:
+                        params['cursor'] = cursor
+                    
+                    response = discoverer.session.get(
+                        f'https://games.roblox.com/v1/games/{game_id}/servers/0',
+                        params=params,
+                        timeout=10
+                    )
+                    
+                    if response.status_code == 429:
+                        retry_after = float(response.headers.get('Retry-After', 5))
+                        self.rate_limiter.record_rate_limit('servers', pair['pair_id'], retry_after)
+                        with self.lock:
+                            self.proxy_stats[pair['pair_id']]['requests'] += 1
+                            self.proxy_stats[pair['pair_id']]['errors'] += 1
+                        time.sleep(min(retry_after, 10))
+                        continue
+                    
+                    if response.status_code != 200:
+                        consecutive_empty += 1
+                        with self.lock:
+                            self.proxy_stats[pair['pair_id']]['requests'] += 1
+                            self.proxy_stats[pair['pair_id']]['errors'] += 1
+                        time.sleep(1)
+                        continue
+                    
+                    self.rate_limiter.record_success('servers', pair['pair_id'])
+                    with self.lock:
+                        self.proxy_stats[pair['pair_id']]['requests'] += 1
+                        self.proxy_stats[pair['pair_id']]['successes'] += 1
+                    
+                    data = response.json()
+                    servers = data.get('data', [])
+                    
+                    if not servers:
+                        consecutive_empty += 1
+                        cursor = data.get('nextPageCursor', '')
+                        if not cursor:
+                            break
+                        continue
+                    
+                    consecutive_empty = 0
+                    new_count = 0
+                    
+                    with discovery_lock:
+                        for server in servers:
+                            job_id = server.get('id')
+                            if job_id and job_id not in all_discovered_servers:
+                                all_discovered_servers[job_id] = server
+                                new_count += 1
+                        found_count += new_count
+                    
+                    with self.lock:
+                        self.proxy_stats[pair['pair_id']]['servers_found'] += new_count
+                    
+                    if new_count > 0:
+                        print(f"📡 {pair['pair_id']}: +{new_count} servers (Total: {len(all_discovered_servers)})")
+                    
+                    cursor = data.get('nextPageCursor', '')
+                    if not cursor:
+                        break
+                    
+                    time.sleep(0.1)
+                    
+                except Exception as e:
+                    consecutive_empty += 1
+                    time.sleep(1)
+            
+            return found_count
+        
+        # Start parallel discovery workers
+        discovery_threads = []
+        for i, pair in enumerate(self.proxy_cookie_pairs):
+            t = threading.Thread(target=parallel_discovery, args=(pair, i))
+            t.daemon = True
+            t.start()
+            discovery_threads.append(t)
+            time.sleep(0.2)  # Stagger starts
+        
+        # Wait for all discovery threads
+        for t in discovery_threads:
+            t.join(timeout=120)  # Max 2 minutes per thread
+        
+        servers = all_discovered_servers
         self.stats['discovered'] = len(servers)
         
         print(f"\n✅ Discovery complete: {len(servers)} servers found")
@@ -1009,8 +1168,8 @@ class ImprovedNonUDMUXScanner:
         for job_id, server_data in servers.items():
             work_queue.put((job_id, server_data))
         
-        # Start workers
-        num_workers = min(len(self.cookies) * 4, 20)  # Max 20 workers
+        # Start workers - use proxy-cookie pairs for better distribution
+        num_workers = min(len(self.proxy_cookie_pairs) * 4, 24)  # Max 24 workers
         workers = []
         
         for i in range(num_workers):
@@ -1085,6 +1244,14 @@ class ImprovedNonUDMUXScanner:
         
         print("\n" + self.edge_detector.get_report())
         
+        # Show proxy performance
+        print("\n🌐 Proxy Performance:")
+        for pair in self.proxy_cookie_pairs:
+            pair_id = pair['pair_id']
+            stats = self.proxy_stats[pair_id]
+            success_rate = (stats['successes'] / max(stats['requests'], 1)) * 100
+            print(f"   {pair_id}: {stats['requests']} requests, {stats['successes']} successes ({success_rate:.1f}%), {stats['servers_found']} found")
+        
         if self.stats['non_udmux'] > 0:
             print(f"\n🎉 SUCCESS! Found {self.stats['non_udmux']} NON-UDMUX servers!")
 
@@ -1108,6 +1275,7 @@ def main():
         return
     
     scanner.cookies = valid_cookies
+    scanner.create_proxy_cookie_pairs()
     
     # Get game ID
     print("\n" + "=" * 80)
