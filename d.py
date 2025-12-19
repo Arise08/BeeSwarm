@@ -735,8 +735,14 @@ class ImprovedNonUDMUXScanner:
         for job_id, server_data in servers.items():
             work_queue.put((job_id, server_data))
         
-        # Reduced from 4x to 2x workers per pair to avoid flooding
-        num_workers = min(len(self.proxy_cookie_pairs) * 2, 12)
+        # Scale workers based on cookie count
+        # More cookies = more parallel capacity
+        if len(self.proxy_cookie_pairs) >= 15:
+            num_workers = min(len(self.proxy_cookie_pairs), 30)  # 1 worker per cookie for 15+
+        elif len(self.proxy_cookie_pairs) >= 8:
+            num_workers = min(len(self.proxy_cookie_pairs) * 2, 20)  # 2x for 8-14 cookies
+        else:
+            num_workers = min(len(self.proxy_cookie_pairs), 6)  # Conservative for few cookies
         workers = []
         for i in range(num_workers):
             t = threading.Thread(target=self.detection_worker, args=(game_id, work_queue, i))
