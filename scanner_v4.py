@@ -34,15 +34,15 @@ import sqlite3
 # CONFIGURATION - Tuned for speed
 # =============================================================================
 CONFIG = {
-    'DISCOVERY_TIMEOUT': 4,
-    'DETECTION_TIMEOUT': 3,
-    'DISCOVERY_DELAY': 0.08,      # 80ms - aggressive but safe
-    'DETECTION_DELAY': 0.03,      # 30ms - very fast
-    'QUEUE_MAXSIZE': 250000,
-    'WORKERS_PER_COOKIE': 6,      # 6 parallel workers per cookie
+    'DISCOVERY_TIMEOUT': 5,
+    'DETECTION_TIMEOUT': 4,
+    'DISCOVERY_DELAY': 0.15,      # 150ms - gentler on system
+    'DETECTION_DELAY': 0.08,      # 80ms - balanced
+    'QUEUE_MAXSIZE': 50000,       # Reduced from 250k
+    'WORKERS_PER_COOKIE': 2,      # Reduced from 6 - saves CPU/RAM
     'MAX_RETRIES': 3,
-    'COOKIE_COOLDOWN': 1.5,       # Minimum seconds between requests per cookie
-    'FLOODED_COOLDOWN': 8.0,      # Extra cooldown if Status 22
+    'COOKIE_COOLDOWN': 2.0,       # 2s between requests per cookie
+    'FLOODED_COOLDOWN': 10.0,     # Extra cooldown if Status 22
 }
 
 # =============================================================================
@@ -203,8 +203,8 @@ class DiscoverySession:
         proxy_url = f"{ptype}://{proxy['user']}:{proxy['pass']}@{proxy['host']}:{proxy['port']}"
         self.session.proxies = {'http': proxy_url, 'https': proxy_url}
         
-        # Aggressive pooling
-        adapter = requests.adapters.HTTPAdapter(pool_connections=40, pool_maxsize=80, max_retries=0)
+        # Moderate pooling - balanced for system resources
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=0)
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
         
@@ -261,8 +261,8 @@ class DetectionSession:
         self.edge = edge_detector
         self.session = requests.Session()
         
-        # Aggressive pooling - KEY for performance
-        adapter = requests.adapters.HTTPAdapter(pool_connections=25, pool_maxsize=50, max_retries=0)
+        # Balanced pooling - won't kill your PC
+        adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=15, max_retries=0)
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
         
@@ -362,15 +362,9 @@ class OptimizedScanner:
     
     def _optimize_system(self):
         try:
-            threading.stack_size(2**21)
-            if sys.platform == "win32":
-                try:
-                    import psutil
-                    p = psutil.Process(os.getpid())
-                    p.nice(psutil.HIGH_PRIORITY_CLASS)
-                    print("✅ High priority + 2MB stack")
-                except:
-                    pass
+            threading.stack_size(2**20)  # 1MB stack (reduced from 2MB)
+            # NOTE: Removed HIGH_PRIORITY - it was making PC unresponsive
+            print("✅ System optimized (normal priority)")
         except:
             pass
     
@@ -626,7 +620,7 @@ class OptimizedScanner:
         print(f"{'='*70}")
         print(f"Game: {game_id}")
         print(f"Cookies: {len(self.cookies)}")
-        print(f"Detection workers: {len(self.cookies) * CONFIG['WORKERS_PER_COOKIE']} (6 per cookie)")
+        print(f"Detection workers: {len(self.cookies) * CONFIG['WORKERS_PER_COOKIE']} ({CONFIG['WORKERS_PER_COOKIE']} per cookie)")
         print(f"Discovery workers: {min(len(self.cookies), len(PROXY_POOL))}")
         print(f"Proxies: {len(PROXY_POOL)}")
         print(f"{'='*70}\n")
