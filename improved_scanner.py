@@ -1153,6 +1153,9 @@ class ImprovedNonUDMUXScanner:
             'checked': 0,
             'non_udmux': 0,
             'udmux': 0,
+            'full': 0,
+            'unauthorized': 0,
+            'game_ended': 0,
             'undetectable': 0,
             'errors': 0,
             'start_time': time.time()
