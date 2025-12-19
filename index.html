@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Content Editor</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Top Toolbar -->
+        <div class="toolbar">
+            <div class="toolbar-section">
+                <button class="toolbar-btn" id="addTextBtn" title="Add Text">
+                    <span class="icon">📝</span>
+                    <span>Add Text</span>
+                </button>
+                <button class="toolbar-btn" id="addImageBtn" title="Add Image">
+                    <span class="icon">🖼️</span>
+                    <span>Add Image</span>
+                </button>
+                <button class="toolbar-btn" id="addShapeBtn" title="Add Shape">
+                    <span class="icon">⬜</span>
+                    <span>Add Shape</span>
+                </button>
+            </div>
+            <div class="toolbar-section">
+                <button class="toolbar-btn" id="clearBtn" title="Clear Canvas">
+                    <span class="icon">🗑️</span>
+                    <span>Clear</span>
+                </button>
+                <button class="toolbar-btn" id="exportBtn" title="Export">
+                    <span class="icon">💾</span>
+                    <span>Export</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Main Canvas Area -->
+        <div class="canvas-container">
+            <div class="canvas" id="canvas">
+                <div class="canvas-placeholder">
+                    <p>Click "Add Text" or "Add Image" to start creating</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Properties Panel -->
+        <div class="properties-panel" id="propertiesPanel">
+            <div class="panel-header">
+                <h3>Properties</h3>
+                <button class="close-btn" id="closePanelBtn">×</button>
+            </div>
+            <div class="panel-content" id="panelContent">
+                <p class="no-selection">Select an element to edit properties</p>
+            </div>
+        </div>
+
+        <!-- Hidden file input for images -->
+        <input type="file" id="imageInput" accept="image/*" style="display: none;">
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
