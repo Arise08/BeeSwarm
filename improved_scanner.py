@@ -38,7 +38,10 @@ class ServerType(Enum):
     """Classification of server connection types"""
     UDMUX = "udmux"
     NON_UDMUX = "non_udmux"
-    UNDETECTABLE = "undetectable"
+    FULL = "full"                # Server is full, can't get connection info
+    UNAUTHORIZED = "unauthorized" # Not allowed to join (VIP/Reserved leak?)
+    GAME_ENDED = "game_ended"    # Server closed between discovery and detection
+    UNDETECTABLE = "undetectable" # Other unknown reasons
     ERROR = "error"
     PENDING = "pending"
 
@@ -408,26 +411,33 @@ class ComprehensiveServerDetector:
             status = data.get('status')
             
             if status == JoinStatus.GAME_FULL.value:
-                # Server is full - we might still be able to get connection info
-                # from joinScriptUrl or other fields
-                server_info.last_error = "Server full"
+                # Server is FULL - this is a specific category now
+                server_info.last_error = "Server full - cannot get connection info"
                 if not join_script:
-                    server_info.server_type = ServerType.UNDETECTABLE
+                    server_info.server_type = ServerType.FULL
                     return server_info
+                # If we have joinScript even when full, continue processing below
             
             elif status == JoinStatus.DISABLED.value:
-                server_info.server_type = ServerType.UNDETECTABLE
-                server_info.last_error = "Server disabled"
+                server_info.server_type = ServerType.GAME_ENDED
+                server_info.last_error = "Server disabled/closing"
                 return server_info
             
             elif status == JoinStatus.GAME_ENDED.value:
-                server_info.server_type = ServerType.UNDETECTABLE
-                server_info.last_error = "Game ended"
+                server_info.server_type = ServerType.GAME_ENDED
+                server_info.last_error = "Game ended - server closed"
                 return server_info
             
             elif status == JoinStatus.UNAUTHORIZED.value:
-                server_info.server_type = ServerType.UNDETECTABLE
-                server_info.last_error = "Unauthorized"
+                # UNAUTHORIZED - likely VIP/Reserved server that leaked into public list
+                server_info.server_type = ServerType.UNAUTHORIZED
+                server_info.last_error = "Unauthorized - possibly VIP/Reserved server"
+                return server_info
+            
+            elif status == JoinStatus.RESTRICTED.value:
+                # RESTRICTED - account doesn't have access
+                server_info.server_type = ServerType.UNAUTHORIZED
+                server_info.last_error = "Restricted - account lacks permission"
                 return server_info
             
             elif status == JoinStatus.ERROR.value:
@@ -704,10 +714,17 @@ class ImprovedNonUDMUXScanner:
             'checked': 0,
             'non_udmux': 0,
             'udmux': 0,
-            'undetectable': 0,
+            'full': 0,           # Server full - can't get connection info
+            'unauthorized': 0,   # Unauthorized/VIP/Reserved
+            'game_ended': 0,     # Server closed
+            'undetectable': 0,   # Other unknown
             'errors': 0,
             'start_time': 0
         }
+        
+        # Real-time results file
+        self.results_file = None
+        self.results_file_lock = threading.Lock()
         
         # Proxy performance tracking
         self.proxy_stats = defaultdict(lambda: {
@@ -910,6 +927,7 @@ class ImprovedNonUDMUXScanner:
                     if result.server_type == ServerType.NON_UDMUX:
                         self.stats['non_udmux'] += 1
                         self.save_server(result)
+                        self.write_result_realtime(game_id, result)
                         print(f"🎯 NON-UDMUX #{self.stats['non_udmux']}: "
                               f"{result.machine_address}:{result.server_port} "
                               f"({result.player_count}/{result.max_players}) "
@@ -917,12 +935,27 @@ class ImprovedNonUDMUXScanner:
                     
                     elif result.server_type == ServerType.UDMUX:
                         self.stats['udmux'] += 1
+                        self.write_result_realtime(game_id, result)
+                    
+                    elif result.server_type == ServerType.FULL:
+                        self.stats['full'] += 1
+                        self.write_result_realtime(game_id, result)
+                    
+                    elif result.server_type == ServerType.UNAUTHORIZED:
+                        self.stats['unauthorized'] += 1
+                        self.write_result_realtime(game_id, result)
+                    
+                    elif result.server_type == ServerType.GAME_ENDED:
+                        self.stats['game_ended'] += 1
+                        self.write_result_realtime(game_id, result)
                     
                     elif result.server_type == ServerType.UNDETECTABLE:
                         self.stats['undetectable'] += 1
+                        self.write_result_realtime(game_id, result)
                     
                     elif result.server_type == ServerType.ERROR:
                         self.stats['errors'] += 1
+                        self.write_result_realtime(game_id, result)
                 
                 job_queue.task_done()
                 
@@ -930,6 +963,67 @@ class ImprovedNonUDMUXScanner:
                 break
             except Exception as e:
                 print(f"⚠️ Worker {worker_id} error: {e}")
+    
+    def init_results_file(self, game_id: str):
+        """Initialize the real-time results file"""
+        filename = f"NonUDMUX_Servers_{game_id}.txt"
+        with self.results_file_lock:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(f"IMPROVED NON-UDMUX SCANNER - REAL-TIME RESULTS\n")
+                f.write(f"Game ID: {game_id}\n")
+                f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Proxies: {len(self.proxy_cookie_pairs)}\n")
+                f.write("=" * 80 + "\n\n")
+                f.write("LEGEND:\n")
+                f.write("  🎯 NON-UDMUX = Direct AWS connection (TARGET!)\n")
+                f.write("  🔒 UDMUX = Proxied through Roblox UDMUX\n")
+                f.write("  🚫 FULL = Server full, can't get connection info\n")
+                f.write("  ⛔ UNAUTHORIZED = VIP/Reserved server leak\n")
+                f.write("  💀 GAME_ENDED = Server closed\n")
+                f.write("  ❓ UNDETECTABLE = Unknown reason\n")
+                f.write("  ❌ ERROR = Request failed\n")
+                f.write("=" * 80 + "\n\n")
+                f.write("REAL-TIME RESULTS (newest at bottom):\n")
+                f.write("-" * 80 + "\n\n")
+        self.results_file = filename
+    
+    def write_result_realtime(self, game_id: str, server: ServerInfo):
+        """Write a single result to file in real-time"""
+        if not self.results_file:
+            return
+        
+        with self.results_file_lock:
+            try:
+                with open(self.results_file, 'a', encoding='utf-8') as f:
+                    timestamp = datetime.now().strftime('%H:%M:%S')
+                    
+                    if server.server_type == ServerType.NON_UDMUX:
+                        f.write(f"[{timestamp}] 🎯 NON-UDMUX: {server.machine_address}:{server.server_port} "
+                               f"| Players: {server.player_count}/{server.max_players} "
+                               f"| Edge: {server.edge_center} | DC: {server.data_center_id}\n")
+                        f.write(f"           Job: {server.job_id}\n")
+                        f.write(f"           Join: Roblox.GameLauncher.joinGameInstance({game_id}, \"{server.job_id}\")\n\n")
+                    
+                    elif server.server_type == ServerType.UDMUX:
+                        f.write(f"[{timestamp}] 🔒 UDMUX: {server.job_id[:20]}... | Players: {server.player_count}/{server.max_players}\n")
+                    
+                    elif server.server_type == ServerType.FULL:
+                        f.write(f"[{timestamp}] 🚫 FULL: {server.job_id[:20]}... | Players: {server.player_count}/{server.max_players} | {server.last_error}\n")
+                    
+                    elif server.server_type == ServerType.UNAUTHORIZED:
+                        f.write(f"[{timestamp}] ⛔ UNAUTHORIZED: {server.job_id[:20]}... | {server.last_error}\n")
+                    
+                    elif server.server_type == ServerType.GAME_ENDED:
+                        f.write(f"[{timestamp}] 💀 GAME_ENDED: {server.job_id[:20]}... | {server.last_error}\n")
+                    
+                    elif server.server_type == ServerType.UNDETECTABLE:
+                        f.write(f"[{timestamp}] ❓ UNDETECTABLE: {server.job_id[:20]}... | Status: {server.join_status} | {server.last_error}\n")
+                    
+                    elif server.server_type == ServerType.ERROR:
+                        f.write(f"[{timestamp}] ❌ ERROR: {server.job_id[:20]}... | {server.last_error}\n")
+                    
+            except Exception as e:
+                pass  # Don't let file errors stop the scan
     
     def save_server(self, server: ServerInfo):
         """Save server to database"""
@@ -965,32 +1059,66 @@ class ImprovedNonUDMUXScanner:
             print(f"⚠️ DB save error: {e}")
     
     def save_results_to_file(self, game_id: str):
-        """Save all results to text file"""
+        """Append final summary to the real-time results file"""
         filename = f"NonUDMUX_Servers_{game_id}.txt"
         
         non_udmux = [s for s in self.all_servers.values() if s.server_type == ServerType.NON_UDMUX]
         udmux = [s for s in self.all_servers.values() if s.server_type == ServerType.UDMUX]
+        full = [s for s in self.all_servers.values() if s.server_type == ServerType.FULL]
+        unauthorized = [s for s in self.all_servers.values() if s.server_type == ServerType.UNAUTHORIZED]
+        game_ended = [s for s in self.all_servers.values() if s.server_type == ServerType.GAME_ENDED]
         undetectable = [s for s in self.all_servers.values() if s.server_type == ServerType.UNDETECTABLE]
         errors = [s for s in self.all_servers.values() if s.server_type == ServerType.ERROR]
         
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(f"IMPROVED NON-UDMUX SCANNER RESULTS\n")
-            f.write(f"Game ID: {game_id}\n")
-            f.write(f"Scan Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        with open(filename, 'a', encoding='utf-8') as f:
+            f.write("\n\n" + "=" * 80 + "\n")
+            f.write("FINAL SUMMARY\n")
+            f.write(f"Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("=" * 80 + "\n\n")
             
-            f.write(f"SUMMARY:\n")
-            f.write(f"  Total Discovered: {self.stats['discovered']}\n")
-            f.write(f"  Total Checked: {self.stats['checked']}\n")
-            f.write(f"  NON-UDMUX (Direct): {len(non_udmux)}\n")
-            f.write(f"  UDMUX (Proxied): {len(udmux)}\n")
-            f.write(f"  Undetectable: {len(undetectable)}\n")
-            f.write(f"  Errors: {len(errors)}\n")
-            f.write("=" * 80 + "\n\n")
+            f.write(f"RESULTS BREAKDOWN:\n")
+            f.write(f"  📊 Total Discovered: {self.stats['discovered']}\n")
+            f.write(f"  🔍 Total Checked: {self.stats['checked']}\n")
+            f.write(f"\n")
+            f.write(f"  🎯 NON-UDMUX (Direct AWS): {len(non_udmux)}\n")
+            f.write(f"  🔒 UDMUX (Proxied): {len(udmux)}\n")
+            f.write(f"  🚫 FULL (Server Full): {len(full)}\n")
+            f.write(f"  ⛔ UNAUTHORIZED (VIP/Reserved): {len(unauthorized)}\n")
+            f.write(f"  💀 GAME_ENDED (Closed): {len(game_ended)}\n")
+            f.write(f"  ❓ UNDETECTABLE (Other): {len(undetectable)}\n")
+            f.write(f"  ❌ ERRORS: {len(errors)}\n")
+            f.write("\n")
             
+            # Calculate percentages
+            total_classified = len(non_udmux) + len(udmux)
+            if total_classified > 0:
+                non_udmux_pct = (len(non_udmux) / total_classified) * 100
+                udmux_pct = (len(udmux) / total_classified) * 100
+                f.write(f"CLASSIFICATION (excluding unclassifiable):\n")
+                f.write(f"  NON-UDMUX: {non_udmux_pct:.1f}%\n")
+                f.write(f"  UDMUX: {udmux_pct:.1f}%\n\n")
+            
+            # Breakdown of why servers couldn't be classified
+            unclassified_total = len(full) + len(unauthorized) + len(game_ended) + len(undetectable) + len(errors)
+            if unclassified_total > 0:
+                f.write(f"WHY {unclassified_total} SERVERS COULDN'T BE CLASSIFIED:\n")
+                if full:
+                    f.write(f"  🚫 Server Full: {len(full)} ({len(full)/unclassified_total*100:.1f}%)\n")
+                if unauthorized:
+                    f.write(f"  ⛔ Unauthorized: {len(unauthorized)} ({len(unauthorized)/unclassified_total*100:.1f}%)\n")
+                if game_ended:
+                    f.write(f"  💀 Game Ended: {len(game_ended)} ({len(game_ended)/unclassified_total*100:.1f}%)\n")
+                if undetectable:
+                    f.write(f"  ❓ Other: {len(undetectable)} ({len(undetectable)/unclassified_total*100:.1f}%)\n")
+                if errors:
+                    f.write(f"  ❌ Errors: {len(errors)} ({len(errors)/unclassified_total*100:.1f}%)\n")
+                f.write("\n")
+            
+            # List all NON-UDMUX servers with full details
             if non_udmux:
-                f.write("NON-UDMUX SERVERS (Direct Connection):\n")
-                f.write("-" * 80 + "\n")
+                f.write("=" * 80 + "\n")
+                f.write("ALL NON-UDMUX SERVERS (Direct Connection):\n")
+                f.write("=" * 80 + "\n")
                 for i, s in enumerate(non_udmux, 1):
                     f.write(f"\n#{i}\n")
                     f.write(f"  Job ID: {s.job_id}\n")
@@ -1001,11 +1129,12 @@ class ImprovedNonUDMUXScanner:
                     f.write(f"  Country: {s.country_code}\n")
                     f.write(f"  Join: Roblox.GameLauncher.joinGameInstance({game_id}, \"{s.job_id}\")\n")
             
+            # Sample of undetectable reasons
             if undetectable:
-                f.write("\n\nUNDETECTABLE SERVERS:\n")
+                f.write("\n\nSAMPLE UNDETECTABLE REASONS (first 20):\n")
                 f.write("-" * 80 + "\n")
-                for s in undetectable[:50]:  # Limit to first 50
-                    f.write(f"  {s.job_id}: {s.last_error}\n")
+                for s in undetectable[:20]:
+                    f.write(f"  Status {s.join_status}: {s.last_error}\n")
             
             f.write("\n\n" + self.edge_detector.get_report())
         
@@ -1163,6 +1292,9 @@ class ImprovedNonUDMUXScanner:
         print("\n🔍 PHASE 2: Server Detection")
         print("-" * 40)
         
+        # Initialize real-time results file
+        self.init_results_file(game_id)
+        
         # Create work queue
         work_queue = queue.Queue()
         for job_id, server_data in servers.items():
@@ -1190,11 +1322,14 @@ class ImprovedNonUDMUXScanner:
                     remaining = len(servers) - checked
                     eta = remaining / rate if rate > 0 else 0
                     
-                    print(f"🔍 Progress: {checked}/{len(servers)} | "
-                          f"NON-UDMUX: {self.stats['non_udmux']} | "
-                          f"UDMUX: {self.stats['udmux']} | "
-                          f"Undetectable: {self.stats['undetectable']} | "
-                          f"Rate: {rate:.1f}/s | ETA: {eta:.0f}s")
+                    print(f"🔍 {checked}/{len(servers)} | "
+                          f"🎯NON-UDMUX:{self.stats['non_udmux']} | "
+                          f"🔒UDMUX:{self.stats['udmux']} | "
+                          f"🚫FULL:{self.stats['full']} | "
+                          f"⛔UNAUTH:{self.stats['unauthorized']} | "
+                          f"💀ENDED:{self.stats['game_ended']} | "
+                          f"❓OTHER:{self.stats['undetectable']} | "
+                          f"{rate:.1f}/s")
                     last_checked = checked
         
         # Signal workers to stop
@@ -1212,10 +1347,15 @@ class ImprovedNonUDMUXScanner:
         print(f"⏱️  Time: {elapsed:.1f}s")
         print(f"📊 Total Discovered: {self.stats['discovered']}")
         print(f"🔍 Total Checked: {self.stats['checked']}")
-        print(f"🎯 NON-UDMUX: {self.stats['non_udmux']}")
-        print(f"🔒 UDMUX: {self.stats['udmux']}")
-        print(f"❓ Undetectable: {self.stats['undetectable']}")
-        print(f"❌ Errors: {self.stats['errors']}")
+        print(f"")
+        print(f"🎯 NON-UDMUX (Direct): {self.stats['non_udmux']}")
+        print(f"🔒 UDMUX (Proxied): {self.stats['udmux']}")
+        print(f"🚫 FULL (Server Full): {self.stats['full']}")
+        print(f"⛔ UNAUTHORIZED (VIP/Reserved): {self.stats['unauthorized']}")
+        print(f"💀 GAME_ENDED (Closed): {self.stats['game_ended']}")
+        print(f"❓ UNDETECTABLE (Other): {self.stats['undetectable']}")
+        print(f"❌ ERRORS: {self.stats['errors']}")
+        print(f"")
         print(f"📈 Rate: {self.stats['checked']/elapsed:.1f} checks/sec")
         
         # Save results
