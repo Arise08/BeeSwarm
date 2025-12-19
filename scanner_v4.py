@@ -39,10 +39,11 @@ CONFIG = {
     'DISCOVERY_DELAY': 0.15,      # 150ms - gentler on system
     'DETECTION_DELAY': 0.08,      # 80ms - balanced
     'QUEUE_MAXSIZE': 50000,       # Reduced from 250k
-    'WORKERS_PER_COOKIE': 2,      # Reduced from 6 - saves CPU/RAM
+    'MAX_DETECTION_WORKERS': 24,  # HARD CAP - never more than this
+    'MAX_DISCOVERY_WORKERS': 6,   # HARD CAP for discovery
     'MAX_RETRIES': 3,
-    'COOKIE_COOLDOWN': 2.0,       # 2s between requests per cookie
-    'FLOODED_COOLDOWN': 10.0,     # Extra cooldown if Status 22
+    'COOKIE_COOLDOWN': 0.5,       # Can be lower with 60 cookies (more rotation)
+    'FLOODED_COOLDOWN': 8.0,      # Extra cooldown if Status 22
 }
 
 # =============================================================================
@@ -84,9 +85,9 @@ class CookieManager:
         self.request_count = [0] * len(cookies)
         self.lock = threading.Lock()
     
-    def get_cookie(self, worker_id: int) -> tuple:
-        """Get cookie for worker, respecting cooldowns"""
-        cookie_idx = worker_id % len(self.cookies)
+    def get_cookie(self, preferred_idx: int) -> tuple:
+        """Get cookie, respecting cooldowns. Returns (idx, cookie, wait_time)"""
+        cookie_idx = preferred_idx % len(self.cookies)
         now = time.time()
         
         with self.lock:
@@ -94,13 +95,14 @@ class CookieManager:
             if now < self.flooded_until[cookie_idx]:
                 wait = self.flooded_until[cookie_idx] - now
                 if wait > 0.1:
-                    return cookie_idx, None, wait  # Caller should wait
+                    return cookie_idx, None, wait  # Caller should try another
             
             # Check cooldown
             elapsed = now - self.last_used[cookie_idx]
             if elapsed < CONFIG['COOKIE_COOLDOWN']:
-                return cookie_idx, self.cookies[cookie_idx], CONFIG['COOKIE_COOLDOWN'] - elapsed
+                return cookie_idx, None, CONFIG['COOKIE_COOLDOWN'] - elapsed  # Caller should try another
             
+            # Cookie is available!
             self.last_used[cookie_idx] = now
             self.request_count[cookie_idx] += 1
             return cookie_idx, self.cookies[cookie_idx], 0
@@ -509,15 +511,15 @@ class OptimizedScanner:
         print(f"⚡ Discovery {worker_id}: {total} servers")
     
     # =========================================================================
-    # DETECTION WORKER - Direct (no proxy) for speed
+    # DETECTION WORKER - Rotates through ALL cookies for best distribution
     # =========================================================================
     def detection_worker(self, game_id: str, worker_id: int):
-        cookie_idx = worker_id % len(self.cookies)
-        cookie = self.cookies[cookie_idx]
-        session = DetectionSession(cookie, self.edge)
+        # Each worker creates sessions for ALL cookies and rotates
+        sessions = {}  # cookie_idx -> session
         
         processed = 0
         found = 0
+        request_count = 0
         
         while True:
             # Check retry queue first
@@ -546,13 +548,36 @@ class OptimizedScanner:
                         continue
                     self.scanned.add(job_id)
             
-            # Cookie cooldown check
-            idx, ck, wait = self.cookie_mgr.get_cookie(worker_id)
-            if ck is None:
-                time.sleep(wait)
-                if not is_retry:
-                    self.retry_queue.add(job_id, data, attempts)
-                continue
+            # Get available cookie (rotates through all 60)
+            # Use worker_id + request_count to spread across cookies
+            search_start = (worker_id + request_count) % len(self.cookies)
+            idx, cookie, wait = self.cookie_mgr.get_cookie(search_start)
+            
+            if cookie is None:
+                # Try other cookies before waiting
+                found_cookie = False
+                for offset in range(1, len(self.cookies)):
+                    alt_idx = (search_start + offset) % len(self.cookies)
+                    idx, cookie, wait = self.cookie_mgr.get_cookie(alt_idx)
+                    if cookie:
+                        found_cookie = True
+                        break
+                
+                if not found_cookie:
+                    time.sleep(min(wait, 0.5))
+                    if not is_retry:
+                        try:
+                            self.server_queue.put_nowait({'job_id': job_id, **data})
+                        except:
+                            pass
+                    continue
+            
+            # Get or create session for this cookie
+            if idx not in sessions:
+                sessions[idx] = DetectionSession(cookie, self.edge)
+            
+            session = sessions[idx]
+            request_count += 1
             
             # Detect
             result = session.detect(game_id, job_id, data['player_count'], data['max_players'])
@@ -620,8 +645,10 @@ class OptimizedScanner:
         print(f"{'='*70}")
         print(f"Game: {game_id}")
         print(f"Cookies: {len(self.cookies)}")
-        print(f"Detection workers: {len(self.cookies) * CONFIG['WORKERS_PER_COOKIE']} ({CONFIG['WORKERS_PER_COOKIE']} per cookie)")
-        print(f"Discovery workers: {min(len(self.cookies), len(PROXY_POOL))}")
+        num_det = min(CONFIG['MAX_DETECTION_WORKERS'], len(self.cookies))
+        num_disc = min(CONFIG['MAX_DISCOVERY_WORKERS'], len(PROXY_POOL))
+        print(f"Detection workers: {num_det} (capped)")
+        print(f"Discovery workers: {num_disc} (capped)")
         print(f"Proxies: {len(PROXY_POOL)}")
         print(f"{'='*70}\n")
         
@@ -638,23 +665,25 @@ class OptimizedScanner:
         
         self.init_file(game_id)
         
-        # Start discovery workers
+        # Start discovery workers (CAPPED)
         disc_threads = []
-        num_disc = min(len(self.cookies), len(PROXY_POOL))
+        num_disc = min(CONFIG['MAX_DISCOVERY_WORKERS'], len(PROXY_POOL))
         for i in range(num_disc):
             proxy = PROXY_POOL[i % len(PROXY_POOL)]
             cookie = self.cookies[i % len(self.cookies)]
             t = threading.Thread(target=self.discovery_worker, args=(game_id, i, proxy, cookie), daemon=True)
             t.start()
             disc_threads.append(t)
+            time.sleep(0.1)  # Stagger starts
         
-        # Start detection workers - 6 per cookie, direct connection
+        # Start detection workers (CAPPED - cookies rotate among workers)
         det_threads = []
-        num_det = len(self.cookies) * CONFIG['WORKERS_PER_COOKIE']
+        num_det = min(CONFIG['MAX_DETECTION_WORKERS'], len(self.cookies))
         for i in range(num_det):
             t = threading.Thread(target=self.detection_worker, args=(game_id, i), daemon=True)
             t.start()
             det_threads.append(t)
+            time.sleep(0.05)  # Stagger starts
         
         print(f"🚀 Started {len(disc_threads)} discovery + {len(det_threads)} detection workers\n")
         
