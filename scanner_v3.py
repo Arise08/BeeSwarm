@@ -912,7 +912,8 @@ class NonUDMUXScannerV3:
                 f.write(f"Total checked: {self.stats['checked']}\n")
         
         if self.stats['non_udmux'] > 0:
-            print(f"\n{Colors.target(f'SUCCESS! Found {self.stats[\"non_udmux\"]} direct AWS servers!')}")
+            count = self.stats['non_udmux']
+            print(f"\n{Colors.target(f'SUCCESS! Found {count} direct AWS servers!')}")
 
 def main():
     print(f"\n{Colors.BOLD}NON-UDMUX SCANNER v3.0{Colors.RESET}")
