@@ -37,6 +37,7 @@ class ServerType(Enum):
     FULL = "full"
     UNAUTHORIZED = "unauthorized"
     GAME_ENDED = "game_ended"
+    FLOODED = "flooded"  # Status 22 - too many join attempts
     UNDETECTABLE = "undetectable"
     ERROR = "error"
     PENDING = "pending"
@@ -53,6 +54,8 @@ class JoinStatus(Enum):
     USER_LEFT = 10
     RESTRICTED = 11
     UNAUTHORIZED = 12
+    # Additional status codes discovered through testing
+    FLOODED = 22  # Too many join attempts / teleport in progress / account busy
 
 
 @dataclass
@@ -275,7 +278,16 @@ class ComprehensiveServerDetector:
             status = data.get('status')
             
             # Handle specific status codes
-            if status == JoinStatus.GAME_FULL.value:
+            if status == JoinStatus.FLOODED.value:
+                # Status 22 = Too many join attempts, account is "busy"
+                server_info.last_error = "Flooded (too many requests)"
+                server_info.server_type = ServerType.FLOODED
+                # This is retryable after a delay
+                if server_info.detection_attempts < max_retries:
+                    time.sleep(2)  # Wait before retry
+                    return self.detect_server(server_info, max_retries)
+                return server_info
+            elif status == JoinStatus.GAME_FULL.value:
                 server_info.last_error = "Server full"
                 if not join_script:
                     server_info.server_type = ServerType.FULL
@@ -387,7 +399,7 @@ class ImprovedNonUDMUXScanner:
         self.lock = threading.Lock()
         self.stats = {
             'discovered': 0, 'checked': 0, 'non_udmux': 0, 'udmux': 0,
-            'full': 0, 'unauthorized': 0, 'game_ended': 0,
+            'full': 0, 'unauthorized': 0, 'game_ended': 0, 'flooded': 0,
             'undetectable': 0, 'errors': 0, 'start_time': 0
         }
         self.results_file = None
@@ -494,6 +506,7 @@ class ImprovedNonUDMUXScanner:
                 f.write("  🚫 FULL = Server full\n")
                 f.write("  ⛔ UNAUTHORIZED = VIP/Reserved\n")
                 f.write("  💀 GAME_ENDED = Server closed\n")
+                f.write("  🌊 FLOODED = Rate limited (Status 22)\n")
                 f.write("  ❓ UNDETECTABLE = Unknown\n")
                 f.write("  ❌ ERROR = Failed\n")
                 f.write("=" * 80 + "\n\n")
@@ -519,6 +532,8 @@ class ImprovedNonUDMUXScanner:
                         f.write(f"[{ts}] ⛔ UNAUTHORIZED: {server.job_id[:20]}... | {server.last_error}\n")
                     elif server.server_type == ServerType.GAME_ENDED:
                         f.write(f"[{ts}] 💀 ENDED: {server.job_id[:20]}... | {server.last_error}\n")
+                    elif server.server_type == ServerType.FLOODED:
+                        f.write(f"[{ts}] 🌊 FLOODED: {server.job_id[:20]}... | {server.last_error} (retried {server.detection_attempts}x)\n")
                     elif server.server_type == ServerType.UNDETECTABLE:
                         f.write(f"[{ts}] ❓ UNKNOWN: {server.job_id[:20]}... | Status:{server.join_status} | {server.last_error}\n")
                     elif server.server_type == ServerType.ERROR:
@@ -576,6 +591,9 @@ class ImprovedNonUDMUXScanner:
                     elif result.server_type == ServerType.GAME_ENDED:
                         self.stats['game_ended'] += 1
                         self.write_result_realtime(game_id, result)
+                    elif result.server_type == ServerType.FLOODED:
+                        self.stats['flooded'] += 1
+                        self.write_result_realtime(game_id, result)
                     elif result.server_type == ServerType.UNDETECTABLE:
                         self.stats['undetectable'] += 1
                         self.write_result_realtime(game_id, result)
@@ -583,6 +601,8 @@ class ImprovedNonUDMUXScanner:
                         self.stats['errors'] += 1
                         self.write_result_realtime(game_id, result)
                 job_queue.task_done()
+                # Small delay to avoid flooding Roblox
+                time.sleep(0.3)
             except queue.Empty:
                 break
             except Exception as e:
@@ -595,6 +615,7 @@ class ImprovedNonUDMUXScanner:
         full = [s for s in self.all_servers.values() if s.server_type == ServerType.FULL]
         unauthorized = [s for s in self.all_servers.values() if s.server_type == ServerType.UNAUTHORIZED]
         game_ended = [s for s in self.all_servers.values() if s.server_type == ServerType.GAME_ENDED]
+        flooded = [s for s in self.all_servers.values() if s.server_type == ServerType.FLOODED]
         undetectable = [s for s in self.all_servers.values() if s.server_type == ServerType.UNDETECTABLE]
         errors = [s for s in self.all_servers.values() if s.server_type == ServerType.ERROR]
         
@@ -605,6 +626,7 @@ class ImprovedNonUDMUXScanner:
             f.write(f"🚫 FULL: {len(full)}\n")
             f.write(f"⛔ UNAUTHORIZED: {len(unauthorized)}\n")
             f.write(f"💀 GAME_ENDED: {len(game_ended)}\n")
+            f.write(f"🌊 FLOODED: {len(flooded)} (rate limited - Status 22)\n")
             f.write(f"❓ UNDETECTABLE: {len(undetectable)}\n")
             f.write(f"❌ ERRORS: {len(errors)}\n")
             f.write(f"\nTotal: {self.stats['checked']}\n")
@@ -626,7 +648,7 @@ class ImprovedNonUDMUXScanner:
         self.all_servers.clear()
         self.stats = {
             'discovered': 0, 'checked': 0, 'non_udmux': 0, 'udmux': 0,
-            'full': 0, 'unauthorized': 0, 'game_ended': 0,
+            'full': 0, 'unauthorized': 0, 'game_ended': 0, 'flooded': 0,
             'undetectable': 0, 'errors': 0, 'start_time': time.time()
         }
         
@@ -713,7 +735,8 @@ class ImprovedNonUDMUXScanner:
         for job_id, server_data in servers.items():
             work_queue.put((job_id, server_data))
         
-        num_workers = min(len(self.proxy_cookie_pairs) * 4, 24)
+        # Reduced from 4x to 2x workers per pair to avoid flooding
+        num_workers = min(len(self.proxy_cookie_pairs) * 2, 12)
         workers = []
         for i in range(num_workers):
             t = threading.Thread(target=self.detection_worker, args=(game_id, work_queue, i))
@@ -735,6 +758,7 @@ class ImprovedNonUDMUXScanner:
                           f"🚫:{self.stats['full']} | "
                           f"⛔:{self.stats['unauthorized']} | "
                           f"💀:{self.stats['game_ended']} | "
+                          f"🌊:{self.stats['flooded']} | "
                           f"❓:{self.stats['undetectable']} | "
                           f"{rate:.1f}/s")
                     last_checked = checked
@@ -754,6 +778,7 @@ class ImprovedNonUDMUXScanner:
         print(f"🚫 FULL: {self.stats['full']}")
         print(f"⛔ UNAUTHORIZED: {self.stats['unauthorized']}")
         print(f"💀 GAME_ENDED: {self.stats['game_ended']}")
+        print(f"🌊 FLOODED: {self.stats['flooded']} (rate limited by Roblox)")
         print(f"❓ UNDETECTABLE: {self.stats['undetectable']}")
         print(f"❌ ERRORS: {self.stats['errors']}")
         print(f"\n📈 Rate: {self.stats['checked']/max(elapsed,1):.1f}/s")
